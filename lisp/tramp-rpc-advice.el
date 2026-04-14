@@ -398,7 +398,7 @@ so that .dir-locals.el files are detected and loaded normally."
   (advice-add 'process-command :around #'tramp-rpc--process-command-advice)
   (advice-add 'process-tty-name :around #'tramp-rpc--process-tty-name-advice)
   (advice-add 'vc-call-backend :around #'tramp-rpc--vc-call-backend-advice)
-(with-eval-after-load 'eglot
+  (with-eval-after-load 'eglot
     (advice-add 'eglot--cmd :around #'tramp-rpc--eglot-cmd-advice))
   (with-eval-after-load 'vc-dir
     (advice-add 'vc-dir-refresh :around #'tramp-rpc--vc-dir-refresh-advice))
@@ -419,7 +419,7 @@ so that .dir-locals.el files are detected and loaded normally."
   (advice-remove 'process-command #'tramp-rpc--process-command-advice)
   (advice-remove 'process-tty-name #'tramp-rpc--process-tty-name-advice)
   (advice-remove 'vc-call-backend #'tramp-rpc--vc-call-backend-advice)
-(advice-remove 'eglot--cmd #'tramp-rpc--eglot-cmd-advice)
+  (advice-remove 'eglot--cmd #'tramp-rpc--eglot-cmd-advice)
   (advice-remove 'vc-dir-refresh #'tramp-rpc--vc-dir-refresh-advice)
   (advice-remove 'magit-start-process #'tramp-rpc--magit-start-process-advice)
   (advice-remove 'hack-dir-local-variables #'tramp-rpc--hack-dir-local-variables-advice))

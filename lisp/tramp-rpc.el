@@ -722,10 +722,54 @@ Creates the directory from `tramp-rpc-controlmaster-path' if needed."
         ;; Set restrictive permissions for security
         (set-file-modes dir #o700)))))
 
-(defvar tramp-rpc--password-prompt-regexp
-  (rx (or "password:" "Password:" "Password for" "passphrase"
-          (seq "Enter passphrase for")))
-  "Regexp matching SSH password/passphrase prompts.")
+;;; ============================================================================
+;;; Authentication via tramp-process-actions
+;;; ============================================================================
+
+;; Reuse upstream TRAMP's `tramp-process-actions' state machine for all
+;; interactive authentication (SSH passwords, sudo, host-key prompts,
+;; OTP, security keys).  This gives us auth-source integration, password
+;; caching, wrong-password detection, and locale-aware prompt matching
+;; for free, instead of reimplementing with a custom regexp + loop.
+
+(defvar tramp-rpc--controlmaster-socket-path nil
+  "Dynamically bound socket path during ControlMaster establishment.
+Used by `tramp-rpc--action-controlmaster-established'.")
+
+(defun tramp-rpc--action-controlmaster-established (proc _vec)
+  "Succeed when the ControlMaster socket file appears, fail on process death.
+The target socket path is read from the dynamic variable
+`tramp-rpc--controlmaster-socket-path'."
+  (cond
+   ((file-exists-p tramp-rpc--controlmaster-socket-path)
+    (throw 'tramp-action 'ok))
+   ((not (process-live-p proc))
+    (while (tramp-accept-process-output proc))
+    (throw 'tramp-action 'process-died))))
+
+(defconst tramp-rpc--controlmaster-actions
+  '((tramp-password-prompt-regexp tramp-action-password)
+    (tramp-wrong-passwd-regexp tramp-action-permission-denied)
+    (tramp-yesno-prompt-regexp tramp-action-yesno)
+    (tramp-yn-prompt-regexp tramp-action-yn)
+    (tramp-process-alive-regexp tramp-rpc--action-controlmaster-established))
+  "Actions for SSH ControlMaster establishment.
+Handles password prompts, host-key verification, and detects the
+ControlMaster socket file appearing as the success condition.")
+
+(defun tramp-rpc--action-sudo-complete (proc _vec)
+  "Succeed when `sudo -v' exits with code 0, fail otherwise."
+  (unless (process-live-p proc)
+    (while (tramp-accept-process-output proc))
+    (throw 'tramp-action
+           (if (zerop (process-exit-status proc)) 'ok 'permission-denied))))
+
+(defconst tramp-rpc--sudo-actions
+  '((tramp-password-prompt-regexp tramp-action-password)
+    (tramp-wrong-passwd-regexp tramp-action-permission-denied)
+    (tramp-process-alive-regexp tramp-rpc--action-sudo-complete))
+  "Actions for `sudo -v' pre-authentication.
+Handles password prompts and detects sudo exit as success.")
 
 ;;; ============================================================================
 ;;; Multi-hop support
@@ -852,45 +896,32 @@ Returns non-nil on success."
     (let ((process-connection-type t))  ; Use PTY for password prompts
       (setq process (apply #'start-process process-name buffer ssh-args)))
     (set-process-query-on-exit-flag process nil)
-    ;; Handle password prompts and wait for connection
-    (let ((start-time (current-time))
-          (timeout 60))  ; 60 second timeout for authentication
-      (while (and (process-live-p process)
-                  (not (file-exists-p socket-path))
-                  (< (float-time (time-subtract (current-time) start-time)) timeout))
-        (with-tramp-suspended-timers
-          (accept-process-output process 0.1))
-        (with-current-buffer buffer
-          (goto-char (point-min))
-          (when (re-search-forward tramp-rpc--password-prompt-regexp nil t)
-            ;; Password prompt detected - ask user
-            (let ((password (read-passwd
-                             (format "Password for %s@%s: "
-                                     (or user (user-login-name)) host))))
-              (when password
-                (process-send-string process (concat password "\n"))
-                ;; Clear the buffer to avoid re-matching the same prompt
-                (erase-buffer)))))))
-    ;; Check if authentication succeeded (socket was created)
-    (if (file-exists-p socket-path)
-        (progn
-          ;; Give it a moment to stabilize
-          (sleep-for 0.1)
-          t)
-      ;; Authentication failed
-      (when (process-live-p process)
-        (delete-process process))
-      (let ((output (with-current-buffer buffer (buffer-string))))
-        (signal
-	 'remote-file-error
-	 (list (format
-		"Failed to establish SSH connection to %s: %s" host output)))))))
+    (set-process-sentinel process #'ignore)
+    ;; Set up process properties for tramp-process-actions / tramp-read-passwd.
+    ;; pw-vector tells auth-source where to look up credentials.
+    (process-put process 'tramp-vector vec)
+    (tramp-set-connection-property process "hop-vector" vec)
+    (tramp-set-connection-property
+     process "pw-vector"
+     (make-tramp-file-name :method "ssh" :user user :host host))
+    ;; Use upstream tramp-process-actions for password/host-key handling.
+    ;; The custom action checks for the ControlMaster socket appearing.
+    (let ((tramp-rpc--controlmaster-socket-path socket-path))
+      (tramp-process-actions process vec nil
+                             tramp-rpc--controlmaster-actions 60))
+    ;; tramp-process-actions throws on failure; reaching here means success.
+    (sleep-for 0.1)
+    t))
 
 (defun tramp-rpc--sudo-authenticate (vec ssh-user)
   "Pre-authenticate sudo on the remote host for VEC.
 Uses the ControlMaster to run `sudo -v' interactively, caching
 credentials so the server can be started with sudo via pipes.
-SSH-USER is the user for the SSH connection (from the rpc hop)."
+SSH-USER is the user for the SSH connection (from the rpc hop).
+
+Uses `tramp-process-actions' with `tramp-rpc--sudo-actions' for
+password handling, giving auth-source integration and password
+caching for free."
   (let* ((host (tramp-file-name-host vec))
          (port (tramp-file-name-port vec))
          (proxyjump (tramp-rpc--hops-to-proxyjump vec))
@@ -918,37 +949,20 @@ SSH-USER is the user for the SSH connection (from the rpc hop)."
     (let ((process-connection-type t))
       (setq process (apply #'start-process process-name buffer ssh-args)))
     (set-process-query-on-exit-flag process nil)
-    ;; Handle sudo password prompt
-    (let ((start-time (current-time))
-          (timeout 60)
-          timed-out)
-      (while (and (process-live-p process)
-                  (< (float-time (time-subtract (current-time) start-time))
-                     timeout))
-        (with-tramp-suspended-timers
-          (accept-process-output process 0.1))
-        (with-current-buffer buffer
-          (goto-char (point-min))
-          (when (re-search-forward tramp-rpc--password-prompt-regexp nil t)
-            (let ((password (read-passwd
-                             (format "Sudo password for %s@%s: "
-                                     ssh-user host))))
-              (process-send-string process (concat password "\n"))
-              ;; Clear the buffer to avoid re-matching
-              (erase-buffer)))))
-      ;; Detect timeout: process still alive after loop exit
-      (when (process-live-p process)
-        (setq timed-out t)
-        (delete-process process))
-      ;; Check result
-      (when (or timed-out
-                (not (zerop (process-exit-status process))))
-        (let ((output (with-current-buffer buffer (buffer-string))))
-          (signal
-           'remote-file-error
-           (list (format "sudo authentication %s on %s: %s"
-                         (if timed-out "timed out" "failed")
-                         host output))))))))
+    (set-process-sentinel process #'ignore)
+    ;; Set up process properties for tramp-process-actions / tramp-read-passwd.
+    ;; pw-vector points to the sudo user so auth-source can look up
+    ;; credentials via e.g. "machine host login user port sudo".
+    (process-put process 'tramp-vector vec)
+    (tramp-set-connection-property process "hop-vector" vec)
+    (tramp-set-connection-property
+     process "pw-vector"
+     (make-tramp-file-name :method "sudo" :user ssh-user :host host))
+    ;; Use upstream tramp-process-actions for password handling.
+    ;; tramp-rpc--action-sudo-complete throws 'ok on exit 0,
+    ;; 'permission-denied otherwise.  tramp-process-actions handles
+    ;; timeout, wrong-password cleanup, and error signaling.
+    (tramp-process-actions process vec nil tramp-rpc--sudo-actions 60)))
 
 (defun tramp-rpc--start-server-process (vec binary-path)
   "Start the RPC server on VEC at BINARY-PATH and verify it responds.
