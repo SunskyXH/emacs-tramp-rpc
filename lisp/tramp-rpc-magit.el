@@ -692,8 +692,9 @@ magit-status on remote repositories."
 
 ;; Fix #m4: Auto-enable behind defcustom gate
 (with-eval-after-load 'magit
-  (when tramp-rpc-magit-optimize
-    (tramp-rpc-magit-enable)))
+  (with-eval-after-load 'tramp-rpc
+    (when tramp-rpc-magit-optimize
+      (tramp-rpc-magit-enable))))
 
 ;; ============================================================================
 ;; Projectile optimizations
@@ -760,7 +761,8 @@ be available, and uses alien indexing for better performance."
 
 ;; Auto-enable when projectile is loaded
 (with-eval-after-load 'projectile
-  (tramp-rpc-projectile-enable))
+  (with-eval-after-load 'tramp-rpc
+    (tramp-rpc-projectile-enable)))
 
 ;; ============================================================================
 ;; Unload support
