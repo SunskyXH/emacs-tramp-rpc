@@ -703,15 +703,14 @@ magit-status on remote repositories."
 (defvar projectile-projects-cache)
 (defvar projectile-projects-cache-time)
 
-(defun tramp-rpc-handle-projectile-get-ext-command (vcs)
-  "Handler to disable fd for remote directories.
-Projectile checks if fd is available using `executable-find' which
-checks the LOCAL machine, but fd may not be available on the REMOTE.
-This forces git ls-files for remote directories."
-  (or ;; For remote RPC directories, always use git ls-files
-      (and (eq vcs 'git) (bound-and-true-p projectile-git-command))
-      ;; Otherwise, use the original function
-      (tramp-run-real-handler 'projectile-get-ext-command (list vcs))))
+(defun tramp-rpc-handle-projectile-dir-files (directory)
+  "Handler to use alien indexing for remote project files.
+Disables fd for remote directories because `projectile-get-ext-command'
+checks fd availability via `executable-find' on the LOCAL machine,
+but fd may not be available on the REMOTE.  Binding
+`projectile-git-use-fd' to nil forces git ls-files instead."
+  (let ((projectile-git-use-fd nil))
+    (projectile-dir-files-alien directory)))
 
 (defun tramp-rpc-handle-projectile-project-files (project-root)
   "Handler to use alien indexing for remote project files.
@@ -740,11 +739,8 @@ This ensures fd is not used for remote directories where it may not
 be available, and uses alien indexing for better performance."
   (interactive)
   (tramp-add-external-operation
-   'projectile-get-ext-command
-   #'tramp-rpc-handle-projectile-get-ext-command 'tramp-rpc)
-  (tramp-add-external-operation
    'projectile-dir-files
-   #'projectile-dir-files-alien 'tramp-rpc)
+   #'tramp-rpc-handle-projectile-dir-files 'tramp-rpc)
   (tramp-add-external-operation
    'projectile-project-files
    #'tramp-rpc-handle-projectile-project-files 'tramp-rpc)
@@ -754,7 +750,6 @@ be available, and uses alien indexing for better performance."
 (defun tramp-rpc-projectile-disable ()
   "Disable tramp-rpc projectile optimizations."
   (interactive)
-  (tramp-remove-external-operation 'projectile-get-ext-command 'tramp-rpc)
   (tramp-remove-external-operation 'projectile-dir-files 'tramp-rpc)
   (tramp-remove-external-operation 'projectile-project-files 'tramp-rpc)
   (message "tramp-rpc projectile optimizations disabled"))
