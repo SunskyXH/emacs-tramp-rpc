@@ -702,6 +702,7 @@ magit-status on remote repositories."
 
 (defvar projectile-projects-cache)
 (defvar projectile-projects-cache-time)
+(defvar projectile-git-use-fd)
 
 (defun tramp-rpc-handle-projectile-dir-files (directory)
   "Handler to use alien indexing for remote project files.
