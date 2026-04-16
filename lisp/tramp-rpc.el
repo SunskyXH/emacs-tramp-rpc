@@ -167,6 +167,9 @@
   (setcdr rpc-entry ssh-params))
 
 ;; Silence byte-compiler warnings for functions defined in with-eval-after-load
+(declare-function tramp-rpc-advice-remove "tramp-rpc-advice")
+(declare-function tramp-add-external-operation "tramp")
+(declare-function tramp-remove-external-operation "tramp")
 (declare-function tramp-rpc--multi-hop-advice "tramp-rpc")
 (declare-function tramp-rpc--sudo-file-name-p "tramp-rpc")
 
@@ -1777,6 +1780,200 @@ ID-FORMAT specifies whether to use numeric or string IDs."
 
 
 ;; ============================================================================
+;; High-level operations
+;; ============================================================================
+
+(defun tramp-rpc--dir-locals-candidate-files (&optional base-el-only)
+  "Return dir-locals candidate file names.
+When BASE-EL-ONLY is non-nil, return only `dir-locals-file'."
+  (let ((file-1 dir-locals-file)
+        (file-2 (and (string-match "\\.el\\'" dir-locals-file)
+                     (replace-match "-2.el" t nil dir-locals-file))))
+    (if base-el-only
+        (list file-1)
+      (delq nil (list file-1 file-2)))))
+
+(defun tramp-rpc--quote-localname (original-localname new-localname)
+  "Return NEW-LOCALNAME with ORIGINAL-LOCALNAME quoting style.
+If ORIGINAL-LOCALNAME is file-name-quoted, quote NEW-LOCALNAME too."
+  (if (file-name-quoted-p original-localname)
+      (file-name-quote new-localname)
+    new-localname))
+
+(defun tramp-rpc--parent-directory (directory)
+  "Return parent directory for DIRECTORY, or nil at filesystem root."
+  (let* ((current (directory-file-name directory))
+         (parent (file-name-directory current)))
+    (when parent
+      (let ((parent (directory-file-name parent)))
+        (unless (equal parent current)
+          parent)))))
+
+(defun tramp-rpc--locate-search-directory (path)
+  "Return lexical search directory for locate-dominating PATH."
+  (if (string-suffix-p "/" path)
+      (directory-file-name path)
+    (let ((normalized (directory-file-name path)))
+      (or (and (file-name-directory normalized)
+               (directory-file-name (file-name-directory normalized)))
+          normalized))))
+
+(defun tramp-rpc--locate-dominating-before-stop-p (search-path dominating-dir)
+  "Return non-nil when DOMINATING-DIR is reachable without crossing stop regexp.
+SEARCH-PATH and DOMINATING-DIR must use the same pathname form (remote/local)
+that `locate-dominating-stop-dir-regexp' is expected to match."
+  (let ((stop locate-dominating-stop-dir-regexp))
+    (if (or (null stop) (equal stop ""))
+        t
+      (let ((current (tramp-rpc--locate-search-directory search-path))
+            (target (directory-file-name dominating-dir))
+            (blocked nil))
+        (while (and current (not blocked) (not (equal current target)))
+          (when (string-match-p stop (file-name-as-directory current))
+            (setq blocked t))
+          (setq current (tramp-rpc--parent-directory current)))
+        (and (not blocked)
+             (equal current target))))))
+
+(defun tramp-rpc-handle-dir-locals--all-files (directory &optional base-el-only)
+  "Like `dir-locals--all-files' for TRAMP-RPC files.
+Return readable dir-locals files in DIRECTORY in increasing priority order."
+  (with-parsed-tramp-file-name
+      (if (file-name-absolute-p directory)
+          directory
+        (file-name-concat default-directory directory))
+      nil
+    ;; Unquote file names (e.g. /: prefix) before sending to server.
+    (let* ((quoted-localname localname)
+           (localdir (directory-file-name (file-name-unquote localname)))
+           (names (tramp-rpc--dir-locals-candidate-files base-el-only))
+           (result (tramp-rpc--call
+                    v "highlevel.test_files_in_dir"
+                    `((directory . ,(tramp-rpc--path-to-bytes localdir))
+                      (names . ,(vconcat names))))))
+      (mapcar (lambda (path)
+                (tramp-make-tramp-file-name
+                 v
+                 (tramp-rpc--quote-localname
+                  quoted-localname
+                  (tramp-rpc--decode-string path))))
+              result))))
+
+(defun tramp-rpc-handle-locate-dominating-file (file name)
+  "Like `locate-dominating-file' for TRAMP-RPC files.
+For string/list NAME, uses a high-level RPC call.  Predicate NAME falls back
+to the built-in implementation."
+  (if (functionp name)
+      (tramp-run-real-handler #'locate-dominating-file (list file name))
+    (with-parsed-tramp-file-name
+        (if (file-name-absolute-p file)
+            file
+          (file-name-concat default-directory file))
+        nil
+      ;; Unquote file names (e.g. /: prefix) before sending to server.
+      (let* ((quoted-localname localname)
+             (localname (file-name-unquote localname))
+             (names (ensure-list name))
+             (result (tramp-rpc--call
+                      v "highlevel.locate_dominating_file_multi"
+                      `((file . ,(tramp-rpc--path-to-bytes localname))
+                        (names . ,(vconcat names))))))
+        (when-let* ((marker (car result))
+                    (marker-path (tramp-rpc--decode-string marker)))
+          (let* ((dominating-dir (file-name-directory marker-path))
+                 (search-remote
+                  (tramp-make-tramp-file-name
+                   v
+                   (tramp-rpc--quote-localname quoted-localname localname)))
+                 (dominating-remote
+                  (tramp-make-tramp-file-name
+                   v
+                   (tramp-rpc--quote-localname quoted-localname dominating-dir))))
+            (when (tramp-rpc--locate-dominating-before-stop-p
+                   search-remote dominating-remote)
+              dominating-remote)))))))
+
+(defun tramp-rpc--dir-locals-cache-update (file cache)
+  "Call RPC helper for `dir-locals-find-file' update using FILE and CACHE."
+  (with-parsed-tramp-file-name
+      (if (file-name-absolute-p file)
+          file
+        (file-name-concat default-directory file))
+      nil
+    ;; Unquote file names (e.g. /: prefix) before sending to server.
+    (let* ((localname (file-name-unquote localname))
+           (file-connection (file-remote-p file))
+           (names (tramp-rpc--dir-locals-candidate-files nil))
+           (cache-dirs
+            (seq-uniq
+             (cl-loop
+              for cache-entry in cache
+              for cache-dir = (car cache-entry)
+              when (string= file-connection (file-remote-p cache-dir))
+              collect (file-name-unquote (file-local-name cache-dir))))))
+      (tramp-rpc--call
+       v "highlevel.dir_locals_find_file_cache_update"
+       `((file . ,(tramp-rpc--path-to-bytes localname))
+         (names . ,(vconcat names))
+         (cache_dirs . ,(vconcat cache-dirs)))))))
+
+(defun tramp-rpc--dir-locals-latest-mtime (files)
+  "Return latest mtime from FILES alist data as a Lisp time value."
+  (let ((latest 0))
+    (dolist (f files latest)
+      (let ((f-time (seconds-to-time (alist-get 'mtime f))))
+        (when (time-less-p latest f-time)
+          (setq latest f-time))))))
+
+(defun tramp-rpc--dir-locals-cache-covers-p (locals-dir cache-dir)
+  "Return non-nil when CACHE-DIR is at or below LOCALS-DIR."
+  (let ((locals (directory-file-name locals-dir))
+        (cache (directory-file-name cache-dir)))
+    (or (equal locals cache)
+        (file-in-directory-p cache locals))))
+
+(defun tramp-rpc-handle-dir-locals-find-file (file)
+  "Like `dir-locals-find-file' for TRAMP-RPC files."
+  (let* ((file (if (file-name-absolute-p file)
+                   file
+                 (file-name-concat default-directory file)))
+         (file-connection (file-remote-p file))
+         (cache-update (tramp-rpc--dir-locals-cache-update file dir-locals-directory-cache))
+         (locals-dir-update (alist-get 'locals cache-update))
+         (locals-dir (when locals-dir-update
+                       (file-name-as-directory
+                        (concat file-connection
+                                (tramp-rpc--decode-string
+                                 (alist-get 'dir locals-dir-update))))))
+         (cache-dir-update (alist-get 'cache cache-update))
+         (cache-dir (when cache-dir-update
+                      (file-name-as-directory
+                       (concat file-connection
+                               (tramp-rpc--decode-string
+                                (alist-get 'dir cache-dir-update))))))
+         (dir-elt (when cache-dir
+                    (seq-find (lambda (elt) (string= (car elt) cache-dir))
+                              dir-locals-directory-cache))))
+    (if (and dir-elt
+             (or (null locals-dir)
+                 (tramp-rpc--dir-locals-cache-covers-p locals-dir (car dir-elt))))
+        ;; Potential cache hit, verify mtimes.
+        (if (or (null (nth 2 dir-elt))
+                (let ((cached-files (alist-get 'files cache-dir-update)))
+                  (and cached-files
+                       (time-equal-p
+                        (nth 2 dir-elt)
+                        (tramp-rpc--dir-locals-latest-mtime cached-files)))))
+            dir-elt
+          (progn
+            ;; Cache entry invalid, clear and return discovered locals dir.
+            (setq dir-locals-directory-cache
+                  (delq dir-elt dir-locals-directory-cache))
+            locals-dir))
+      ;; No cache entry.
+      locals-dir)))
+
+;; ============================================================================
 ;; Directory operations
 ;; ============================================================================
 
@@ -2759,7 +2956,11 @@ Also controls process exit detection latency."
 ;; Process support, advice functions, and magit integration are now in
 ;; separate modules for better organization and maintainability.
 (require 'tramp-rpc-process)
-(require 'tramp-rpc-advice)
+;; Loading tramp-rpc-advice while this file is being byte-compiled can
+;; recurse on some Emacs/TRAMP combinations.  Advice is still loaded at
+;; runtime when `tramp-rpc' is required normally.
+(unless (bound-and-true-p byte-compile-current-file)
+  (require 'tramp-rpc-advice))
 (require 'tramp-rpc-magit)
 
 ;; ============================================================================
@@ -2845,6 +3046,9 @@ Also controls process exit detection latency."
     ;; RPC-based path and VC operations
     ;; =========================================================================
     (expand-file-name . tramp-rpc-handle-expand-file-name)
+    (locate-dominating-file . tramp-rpc-handle-locate-dominating-file)
+    (dir-locals--all-files . tramp-rpc-handle-dir-locals--all-files)
+    (dir-locals-find-file . tramp-rpc-handle-dir-locals-find-file)
     (vc-registered . tramp-rpc-handle-vc-registered)
 
     ;; =========================================================================
@@ -2901,6 +3105,13 @@ Also controls process exit detection latency."
     (unhandled-file-name-directory . ignore) ; Should return nil for TRAMP
     )
   "Alist of handler functions for TRAMP-RPC method.")
+
+;; Defer registration until tramp-rpc is fully loaded so
+;; `tramp-add-external-operation' can safely `(require 'tramp-rpc)'.
+(with-eval-after-load 'tramp-rpc
+  (tramp-add-external-operation 'locate-dominating-file 'tramp-rpc-handle-locate-dominating-file 'tramp-rpc)
+  (tramp-add-external-operation 'dir-locals--all-files 'tramp-rpc-handle-dir-locals--all-files 'tramp-rpc)
+  (tramp-add-external-operation 'dir-locals-find-file 'tramp-rpc-handle-dir-locals-find-file 'tramp-rpc))
 
 ;;;###autoload
 (defun tramp-rpc-file-name-handler (operation &rest args)
@@ -3043,15 +3254,22 @@ cleanup of all connections has run."
 
 (defun tramp-rpc-unload-function ()
   "Unload function for tramp-rpc.
-Removes advice and cleanup hooks.  Deletes `tramp-rpc-method' from
-`tramp-methods', and `tramp-rpc-file-name-p' from
-`tramp-foreign-file-name-handler-alist'."
-  ;; Remove advice.
-  (tramp-rpc--multi-hop-advice-remove)
-  ;; Remove cleanup hooks.
+Removes advice and cleans up async processes."
+  ;; Remove high-level external operations from tramp-rpc core.
+  (tramp-remove-external-operation 'locate-dominating-file 'tramp-rpc)
+  (tramp-remove-external-operation 'dir-locals--all-files 'tramp-rpc)
+  (tramp-remove-external-operation 'dir-locals-find-file 'tramp-rpc)
+  ;; Remove all advice (from tramp-rpc-advice module)
+  (tramp-rpc-advice-remove)
+  ;; Remove legacy multi-hop advice and cleanup hooks.
+  (advice-remove 'tramp-multi-hop-p #'tramp-rpc--multi-hop-advice)
   (remove-hook 'tramp-cleanup-connection-hook #'tramp-rpc-cleanup-connection)
   (remove-hook 'tramp-cleanup-all-connections-hook #'tramp-rpc-cleanup-all-connections)
-  ;; Clean up `tramp-methods' and `tramp-foreign-file-name-handler-alist'.
+  ;; Clean up all async processes (from tramp-rpc-process module)
+  (tramp-rpc--cleanup-async-processes)
+  ;; Clean up PTY processes (from tramp-rpc-process module)
+  (tramp-rpc--cleanup-pty-processes)
+  ;; Remove method registrations.
   (setq tramp-methods (delete (assoc tramp-rpc-method tramp-methods) tramp-methods))
   (setq tramp-foreign-file-name-handler-alist
 	(delete (assoc 'tramp-rpc--sudo-file-name-p

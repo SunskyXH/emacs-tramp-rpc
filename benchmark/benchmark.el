@@ -39,6 +39,14 @@
 (defvar tramp-rpc-benchmark-test-dir "/tmp/tramp-benchmark"
   "Remote directory to use for tests (will be created/cleaned).")
 
+(defconst tramp-rpc-benchmark--deep-relative-file
+  (concat "project/"
+          (mapconcat (lambda (i) (format "d%02d" i))
+                     (number-sequence 1 12)
+                     "/")
+          "/deep.txt")
+  "Relative path for deep traversal benchmarks (12 directories deep).")
+
 ;;; Results storage
 
 (defvar tramp-rpc-benchmark-results nil
@@ -331,6 +339,22 @@ Same operations as batch-mixed-ops but done one at a time."
     (tramp-rpc-benchmark--time
      (ignore (file-exists-p file)))))
 
+(defun tramp-rpc-benchmark--locate-dominating-file (method)
+  "Benchmark `locate-dominating-file' for METHOD."
+  (let ((file (tramp-rpc-benchmark--make-path method tramp-rpc-benchmark--deep-relative-file)))
+    (tramp-rpc-benchmark--flush-cache file)
+    (tramp-rpc-benchmark--time
+     (locate-dominating-file file ".git"))))
+
+(defun tramp-rpc-benchmark--dir-locals-find-file (method)
+  "Benchmark `dir-locals-find-file' for METHOD."
+  (let ((file (tramp-rpc-benchmark--make-path method tramp-rpc-benchmark--deep-relative-file)))
+    (tramp-rpc-benchmark--flush-cache file)
+    (tramp-rpc-benchmark--time
+     ;; Measure resolution path, not the global dir-locals cache hit path.
+     (let ((dir-locals-directory-cache nil))
+       (dir-locals-find-file file)))))
+
 ;;; Main benchmark runner
 
 (defconst tramp-rpc-benchmark--tests
@@ -347,6 +371,8 @@ Same operations as batch-mixed-ops but done one at a time."
     ("process-file-cat"   . tramp-rpc-benchmark--process-file-cat)
     ("copy-file"          . tramp-rpc-benchmark--copy-file)
     ("multi-stat"         . tramp-rpc-benchmark--multiple-stats)
+    ("locate-dominating-file" . tramp-rpc-benchmark--locate-dominating-file)
+    ("dir-locals-find-file" . tramp-rpc-benchmark--dir-locals-find-file)
     ("seq-mixed-ops"      . tramp-rpc-benchmark--sequential-mixed-ops))
   "Alist of benchmark tests (name . function).")
 

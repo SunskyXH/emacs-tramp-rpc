@@ -266,7 +266,7 @@ process-file calls are routed through the TRAMP handler."
                               (stringp file)
                               (tramp-tramp-file-p file)
                               ;; Operations that take a file and may call process-file
-                              (memq function-name '(state state-heuristic dir-status-files
+                              (memq function-name '(registered state state-heuristic dir-status-files
                                                     working-revision previous-revision next-revision
                                                     responsible-p)))))
     (if should-set-dir
@@ -362,19 +362,12 @@ exited (remote side finished), delete it so the refresh can proceed."
 ;; Dir-locals advice
 ;; ============================================================================
 
-;; Emacs's `enable-remote-dir-locals' defaults to nil because looking
-;; for .dir-locals.el on remote hosts can be slow for traditional TRAMP
-;; methods that pipe shell commands over SSH.  TRAMP-RPC uses an
-;; efficient binary protocol with caching, so this concern does not
-;; apply.  Rather than setting the variable globally (which would affect
-;; all TRAMP methods), we advise `hack-dir-local-variables' to enable
-;; it only for buffers visiting files via the RPC method.
-
+;; Emacs's `enable-remote-dir-locals' defaults to nil because looking for
+;; .dir-locals.el on remote hosts can be slow for traditional TRAMP methods.
+;; TRAMP-RPC uses a fast binary protocol and dedicated high-level operations,
+;; so enable this only for buffers using the rpc method.
 (defun tramp-rpc--hack-dir-local-variables-advice (orig-fun)
-  "Enable dir-locals for buffers visiting TRAMP-RPC remote files.
-Let-binds `enable-remote-dir-locals' to t when the current buffer
-is visiting a file (or has `default-directory') on an RPC remote,
-so that .dir-locals.el files are detected and loaded normally."
+  "Enable remote dir-locals in `hack-dir-local-variables' for RPC files."
   (let ((enable-remote-dir-locals
          (or enable-remote-dir-locals
              (when-let* ((file (or (buffer-file-name) default-directory)))

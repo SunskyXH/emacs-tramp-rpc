@@ -9,9 +9,11 @@ use crate::protocol::{from_value, IntoValue, RpcError};
 use rmpv::Value;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::Path;
+use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
+use std::time::UNIX_EPOCH;
 
 use super::HandlerResult;
 
@@ -109,10 +111,7 @@ pub async fn run_parallel(params: Value) -> HandlerResult {
             // Recover from thread panics instead of unwinding
             handles
                 .into_iter()
-                .filter_map(|h| match h.join() {
-                    Ok(result) => Some(result),
-                    Err(_) => None, // thread panicked; skip this result
-                })
+                .filter_map(|h| h.join().ok()) // thread panicked; skip this result
                 .collect()
         });
 
@@ -199,6 +198,262 @@ pub async fn ancestors_scan(params: Value) -> HandlerResult {
             .collect();
 
         Ok(Value::Map(pairs))
+    })
+    .await
+    .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
+}
+
+fn canonical_or_original(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn find_existing_start(path: &Path) -> Option<&Path> {
+    if path.exists() {
+        return Some(path);
+    }
+
+    let mut current = path;
+    while !current.exists() {
+        current = current.parent()?;
+    }
+    Some(current)
+}
+
+fn as_search_dir(path: &Path) -> Option<PathBuf> {
+    if path.is_dir() {
+        Some(path.to_path_buf())
+    } else {
+        path.parent().map(|p| p.to_path_buf())
+    }
+}
+
+const MAX_DOMINATING_DEPTH: usize = 100;
+
+fn find_dominating_dir(
+    start_dir: &Path,
+    names: &[String],
+) -> Result<Option<(PathBuf, Vec<String>)>, RpcError> {
+    let mut current = start_dir.to_path_buf();
+    let mut depth = 0usize;
+    loop {
+        let found: Vec<String> = names
+            .iter()
+            .filter(|name| current.join(name.as_str()).exists())
+            .cloned()
+            .collect();
+
+        if !found.is_empty() {
+            return Ok(Some((current, found)));
+        }
+
+        match current.parent() {
+            Some(parent) if parent != current => {
+                if depth >= MAX_DOMINATING_DEPTH {
+                    return Err(RpcError::invalid_params(format!(
+                        "Maximum ancestor traversal depth ({}) exceeded",
+                        MAX_DOMINATING_DEPTH
+                    )));
+                }
+                current = parent.to_path_buf();
+                depth += 1;
+            }
+            _ => return Ok(None),
+        }
+    }
+}
+
+fn remap_to_lexical_ancestor(start_dir: &Path, found_dir: &Path) -> PathBuf {
+    let canonical_found = canonical_or_original(found_dir);
+    let mut current = start_dir.to_path_buf();
+    loop {
+        if canonical_or_original(&current) == canonical_found {
+            return current;
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent.to_path_buf(),
+            _ => return found_dir.to_path_buf(),
+        }
+    }
+}
+
+fn mtime_seconds(path: &Path) -> Option<i64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let duration = modified.duration_since(UNIX_EPOCH).ok()?;
+    Some(duration.as_secs() as i64)
+}
+
+/// Return readable regular files from a directory for a list of names.
+pub async fn highlevel_test_files_in_dir(params: Value) -> HandlerResult {
+    #[derive(Deserialize)]
+    struct Params {
+        directory: String,
+        names: Vec<String>,
+    }
+
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+
+    tokio::task::spawn_blocking(move || {
+        let dir = canonical_or_original(Path::new(&params.directory));
+        if !dir.is_dir() {
+            return Ok(Value::Array(vec![]));
+        }
+
+        let mut found = Vec::new();
+        for name in &params.names {
+            let candidate = dir.join(name);
+            if candidate.is_file() && File::open(&candidate).is_ok() {
+                found.push(candidate.to_string_lossy().to_string().into_value());
+            }
+        }
+        Ok(Value::Array(found))
+    })
+    .await
+    .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
+}
+
+/// Locate marker files in ancestor directories.
+///
+/// Returns marker paths from the first ancestor that contains any markers.
+pub async fn highlevel_locate_dominating_file_multi(params: Value) -> HandlerResult {
+    #[derive(Deserialize)]
+    struct Params {
+        file: String,
+        names: Vec<String>,
+    }
+
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+
+    tokio::task::spawn_blocking(move || {
+        let path = PathBuf::from(&params.file);
+        // Preserve lexical path shape instead of canonicalizing symlinks.
+        // TRAMP clients rely on this to compute repo-relative paths correctly.
+        let Some(existing_start) = find_existing_start(&path) else {
+            return Ok(Value::Array(vec![]));
+        };
+        let Some(start_dir) = as_search_dir(existing_start) else {
+            return Ok(Value::Array(vec![]));
+        };
+
+        let Some((dir, found_names)) = find_dominating_dir(&start_dir, &params.names)? else {
+            return Ok(Value::Array(vec![]));
+        };
+
+        let marker_paths: Vec<Value> = found_names
+            .into_iter()
+            .map(|name| dir.join(name).to_string_lossy().to_string().into_value())
+            .collect();
+        Ok(Value::Array(marker_paths))
+    })
+    .await
+    .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
+}
+
+/// Prepare dir-locals data in one RPC call.
+pub async fn highlevel_dir_locals_find_file_cache_update(params: Value) -> HandlerResult {
+    #[derive(Deserialize)]
+    struct Params {
+        file: String,
+        names: Vec<String>,
+        #[serde(default)]
+        cache_dirs: Vec<String>,
+    }
+
+    let params: Params = from_value(params).map_err(|e| RpcError::invalid_params(e.to_string()))?;
+
+    tokio::task::spawn_blocking(move || {
+        let file_path = PathBuf::from(&params.file);
+        // Keep lexical (non-canonical) path shape to match locate-dominating behavior.
+        let lexical_file = file_path.clone();
+        let file_value = lexical_file.to_string_lossy().to_string().into_value();
+
+        let Some(existing_start) = find_existing_start(&file_path) else {
+            return Ok(msgpack_map! {
+                "file" => file_value,
+                "locals" => Value::Nil,
+                "cache" => Value::Nil
+            });
+        };
+        let Some(start_dir) = as_search_dir(existing_start) else {
+            return Ok(msgpack_map! {
+                "file" => file_value,
+                "locals" => Value::Nil,
+                "cache" => Value::Nil
+            });
+        };
+
+        let locals_value =
+            if let Some((locals_dir, _)) = find_dominating_dir(&start_dir, &params.names)? {
+                let locals_dir = remap_to_lexical_ancestor(&start_dir, &locals_dir);
+                let local_files: Vec<Value> = params
+                    .names
+                    .iter()
+                    .filter_map(|name| {
+                        let p = locals_dir.join(name);
+                        if p.is_file() {
+                            mtime_seconds(&p).map(|mtime| {
+                                msgpack_map! {
+                                    "name" => name.clone(),
+                                    "mtime" => mtime
+                                }
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                msgpack_map! {
+                    "dir" => locals_dir.to_string_lossy().to_string(),
+                    "files" => Value::Array(local_files)
+                }
+            } else {
+                Value::Nil
+            };
+
+        let mut best_cache: Option<PathBuf> = None;
+        for cache_dir in &params.cache_dirs {
+            let p = PathBuf::from(cache_dir);
+            if p.is_dir()
+                && lexical_file.starts_with(&p)
+                && best_cache
+                    .as_ref()
+                    .map(|best| p.components().count() > best.components().count())
+                    .unwrap_or(true)
+            {
+                best_cache = Some(p);
+            }
+        }
+
+        let cache_value = if let Some(cache_dir) = best_cache {
+            let cache_files: Vec<Value> = params
+                .names
+                .iter()
+                .filter_map(|name| {
+                    let p = cache_dir.join(name);
+                    if p.is_file() {
+                        mtime_seconds(&p).map(|mtime| {
+                            msgpack_map! {
+                                "name" => name.clone(),
+                                "mtime" => mtime
+                            }
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            msgpack_map! {
+                "dir" => cache_dir.to_string_lossy().to_string(),
+                "files" => Value::Array(cache_files)
+            }
+        } else {
+            Value::Nil
+        };
+
+        Ok(msgpack_map! {
+            "file" => file_value,
+            "locals" => locals_value,
+            "cache" => cache_value
+        })
     })
     .await
     .map_err(|e| RpcError::internal_error(format!("Task join error: {}", e)))?
